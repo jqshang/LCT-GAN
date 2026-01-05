@@ -1,7 +1,14 @@
 import argparse
+import csv
+import json
 import os
 import random
-from typing import Dict
+from dataclasses import asdict, is_dataclass
+from datetime import datetime
+from typing import Any, Dict, Optional
+
+from pesq import pesq as _pesq
+from pystoi import stoi as _stoi
 
 import numpy as np
 import torch
@@ -27,6 +34,64 @@ def set_seed(seed: int = 42):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def _now_timestamp() -> str:
+    """Filesystem-safe timestamp for experiment versioning."""
+    # Example: 20260105_142530
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _ensure_dir(path: str) -> str:
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _to_jsonable(obj: Any) -> Any:
+    """Best-effort conversion of common config objects into JSON-serializable types."""
+    if is_dataclass(obj):
+        return asdict(obj)
+    if hasattr(obj, "__dict__"):
+        # argparse.Namespace, many config classes
+        return {k: _to_jsonable(v) for k, v in vars(obj).items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_jsonable(x) for x in obj]
+    if isinstance(obj, dict):
+        return {str(k): _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    # Fallback: string representation
+    return str(obj)
+
+
+def _write_json(path: str, payload: Any) -> None:
+    _ensure_dir(os.path.dirname(path) or ".")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(_to_jsonable(payload), f, indent=2, sort_keys=True)
+
+
+def _append_csv_row(csv_path: str,
+                    row: Dict[str, Any],
+                    fieldnames: Optional[list] = None) -> None:
+    """Append a row to a CSV file, creating it with a header if missing."""
+    _ensure_dir(os.path.dirname(csv_path) or ".")
+    file_exists = os.path.exists(csv_path)
+
+    if fieldnames is None:
+        # Stable ordering: if file exists, reuse its header; else use row keys.
+        if file_exists:
+            with open(csv_path, "r", encoding="utf-8", newline="") as rf:
+                reader = csv.reader(rf)
+                header = next(reader, None)
+            fieldnames = header if header else list(row.keys())
+        else:
+            fieldnames = list(row.keys())
+
+    with open(csv_path, "a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def prepare_dataloaders(
@@ -194,35 +259,130 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def validate(
+def _si_sdr_torch(reference: torch.Tensor,
+                  estimate: torch.Tensor,
+                  eps: float = 1e-8) -> float:
+    """Vectorized SI-SDR for a single pair. reference/estimate are 1D tensors."""
+    # Align length
+    min_len = min(reference.shape[-1], estimate.shape[-1])
+    reference = reference[..., :min_len]
+    estimate = estimate[..., :min_len]
+
+    # Zero mean
+    reference = reference - reference.mean()
+    estimate = estimate - estimate.mean()
+
+    ref_energy = torch.sum(reference**2) + eps
+    scale = torch.sum(reference * estimate) / ref_energy
+    s_target = scale * reference
+    e_noise = estimate - s_target
+
+    val = 10.0 * torch.log10(
+        (torch.sum(s_target**2) + eps) / (torch.sum(e_noise**2) + eps))
+    return float(val.item())
+
+
+@torch.no_grad()
+def validate_and_compute_metrics(
+    *,
     epoch: int,
     loaders: Dict[str, DataLoader],
     enhancer: LCTEnhancer,
     mrstft_loss: MultiResolutionSTFTLoss,
     device: torch.device,
     args: argparse.Namespace,
-) -> float:
+) -> Dict[str, float]:
+    """Run validation and compute metrics.
+
+    Always computes MR-STFT loss and SI-SDR.
+    Optionally computes PESQ/STOI if the required packages are available.
+    """
     enhancer.eval()
     mrstft_loss.eval()
 
     val_loader = loaders["val"]
 
-    total_loss = 0.0
+    total_mr = 0.0
+    total_si_sdr = 0.0
+    total_pesq = 0.0
+    total_stoi = 0.0
+    n_pesq = 0
+    n_stoi = 0
     count = 0
 
     for batch in val_loader:
         noisy = batch["noisy"].to(device)  # [B, T]
         clean = batch["clean"].to(device)  # [B, T]
+        lengths = batch.get("lengths", None)
 
         enhanced, _ = enhancer(noisy)
         mr_loss, _ = mrstft_loss(enhanced, clean)
 
-        total_loss += mr_loss.item() * noisy.size(0)
-        count += noisy.size(0)
+        B = noisy.size(0)
+        total_mr += mr_loss.item() * B
 
-    avg_loss = total_loss / max(count, 1)
-    print(f"[Epoch {epoch:03d}] Validation MR-STFT Loss: {avg_loss:.4f}")
-    return avg_loss
+        for b in range(B):
+            # If padded, try to use provided lengths
+            if lengths is not None:
+                L = int(lengths[b])
+                ref = clean[b, :L]
+                est = enhanced[b, :L]
+            else:
+                ref = clean[b]
+                est = enhanced[b]
+
+            total_si_sdr += _si_sdr_torch(ref, est)
+
+            # PESQ (wideband) + STOI are optional
+            if _pesq is not None:
+                ref_np = ref.detach().cpu().numpy()
+                est_np = est.detach().cpu().numpy()
+                min_len = min(ref_np.shape[-1], est_np.shape[-1])
+                if min_len > 0:
+                    try:
+                        total_pesq += float(
+                            _pesq(args.sample_rate, ref_np[:min_len],
+                                  est_np[:min_len], "wb"))
+                        n_pesq += 1
+                    except Exception:
+                        # Some edge cases (very short signals, SR mismatch, etc.)
+                        pass
+
+            if _stoi is not None:
+                ref_np = ref.detach().cpu().numpy()
+                est_np = est.detach().cpu().numpy()
+                min_len = min(ref_np.shape[-1], est_np.shape[-1])
+                if min_len > 0:
+                    try:
+                        total_stoi += float(
+                            _stoi(ref_np[:min_len],
+                                  est_np[:min_len],
+                                  args.sample_rate,
+                                  extended=False))
+                        n_stoi += 1
+                    except Exception:
+                        pass
+
+        count += B
+
+    avg_mr = total_mr / max(count, 1)
+    avg_si_sdr = total_si_sdr / max(count, 1)
+    avg_pesq = (total_pesq / max(n_pesq, 1)) if n_pesq > 0 else float("nan")
+    avg_stoi = (total_stoi / max(n_stoi, 1)) if n_stoi > 0 else float("nan")
+
+    msg = f"[Epoch {epoch:03d}] Val MR-STFT={avg_mr:.4f} | SI-SDR={avg_si_sdr:.3f}"
+    if n_pesq > 0:
+        msg += f" | PESQ={avg_pesq:.3f}"
+    if n_stoi > 0:
+        msg += f" | STOI={avg_stoi:.4f}"
+    print(msg)
+
+    return {
+        "val_mrstft": float(avg_mr),
+        "val_si_sdr": float(avg_si_sdr),
+        "val_pesq": float(avg_pesq),
+        "val_stoi": float(avg_stoi),
+    }
 
 
 def _align_tf_targets(
@@ -256,6 +416,22 @@ def _align_tf_targets(
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Train LCT-GAN (LCTEnhancer + MPD/MSD)")
+
+    # Experiment management
+    parser.add_argument(
+        "--expr_root",
+        type=str,
+        default="exprs",
+        help="Root directory to store experiment runs (default: exprs/).",
+    )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help=
+        ("Path to a checkpoint to resume from (e.g., exprs/<ts>/ckpts/last.pt). "
+         "If provided, the existing experiment directory is reused."),
+    )
 
     # Data
     parser.add_argument(
@@ -328,17 +504,51 @@ def parse_args():
                         default="cuda",
                         help="'cuda' or 'cpu'")
     parser.add_argument("--log_interval", type=int, default=50)
-    parser.add_argument("--save_dir", type=str, default="checkpoints")
+
+    # Validation / checkpointing cadence
+    parser.add_argument(
+        "--val_interval",
+        type=int,
+        default=50,
+        help="Run validation + metrics every N epochs (default: 50).",
+    )
+    parser.add_argument(
+        "--ckpt_interval",
+        type=int,
+        default=50,
+        help="Save periodic checkpoints every N epochs (default: 50).",
+    )
 
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    os.makedirs(args.save_dir, exist_ok=True)
-
     set_seed(args.seed)
 
+    # -----------------------
+    # Experiment directories
+    # -----------------------
+    if args.resume is not None:
+        resume_path = os.path.abspath(args.resume)
+        ckpt_dir = os.path.dirname(resume_path)
+        run_dir = os.path.dirname(ckpt_dir)
+        if os.path.basename(ckpt_dir) != "ckpts":
+            # Still try to be helpful if user points to a non-standard location.
+            ckpt_dir = os.path.join(run_dir, "ckpts")
+        print(f"Resuming from: {resume_path}")
+        print(f"Using existing run_dir: {run_dir}")
+    else:
+        run_dir = os.path.join(args.expr_root, _now_timestamp())
+        ckpt_dir = os.path.join(run_dir, "ckpts")
+
+    _ensure_dir(run_dir)
+    _ensure_dir(ckpt_dir)
+
+    configs_path = os.path.join(run_dir, "configs.json")
+    metrics_csv = os.path.join(run_dir, "metrics.csv")
+
+    # Device
     device = torch.device(args.device if torch.cuda.is_available()
                           or args.device == "cpu" else "cpu")
 
@@ -399,9 +609,46 @@ def main():
         betas=tuple(args.betas_d),
     )
 
-    best_val = float("inf")
+    if args.resume is None:
+        payload = {
+            "run_dir": run_dir,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "args": vars(args),
+            "gen_cfg": _to_jsonable(gen_cfg),
+            "tf_cfg": _to_jsonable(tf_cfg),
+            "mr_cfg": _to_jsonable(mr_cfg),
+        }
+        print("===== Training configuration =====")
+        print(json.dumps(_to_jsonable(payload), indent=2, sort_keys=True))
+        _write_json(configs_path, payload)
+        print(f"Saved configs to: {configs_path}")
+    else:
+        # On resume, do not overwrite configs.json.
+        if os.path.exists(configs_path):
+            print(f"Found existing configs.json: {configs_path}")
 
-    for epoch in range(1, args.epochs + 1):
+    start_epoch = 1
+    best_val = float("inf")
+    best_epoch = 0
+    if args.resume is not None:
+        ckpt = torch.load(os.path.abspath(args.resume), map_location=device)
+        enhancer.load_state_dict(ckpt["enhancer"], strict=True)
+        mpd.load_state_dict(ckpt["mpd"], strict=True)
+        msd.load_state_dict(ckpt["msd"], strict=True)
+        if "g_opt" in ckpt:
+            g_opt.load_state_dict(ckpt["g_opt"])
+        if "d_opt" in ckpt:
+            d_opt.load_state_dict(ckpt["d_opt"])
+        start_epoch = int(ckpt.get("epoch", 0)) + 1
+        best_val = float(
+            ckpt.get("best_val", ckpt.get("val_loss", float("inf"))))
+        best_epoch = int(ckpt.get("best_epoch", 0))
+        print(
+            f"Resumed at epoch {start_epoch} (best_val={best_val:.4f} from epoch {best_epoch})."
+        )
+
+    # Main loop
+    for epoch in range(start_epoch, args.epochs + 1):
         train_one_epoch(
             epoch=epoch,
             loaders=loaders,
@@ -416,34 +663,72 @@ def main():
             args=args,
         )
 
-        val_loss = validate(
-            epoch=epoch,
-            loaders=loaders,
-            enhancer=enhancer,
-            mrstft_loss=mrstft_loss,
-            device=device,
-            args=args,
-        )
+        # Validation + metrics every N epochs (and always on the final epoch)
+        do_val = (epoch % max(args.val_interval, 1) == 0) or (epoch
+                                                              == args.epochs)
+        val_metrics: Dict[str, float] = {}
+        improved = False
+        if do_val:
+            val_metrics = validate_and_compute_metrics(
+                epoch=epoch,
+                loaders=loaders,
+                enhancer=enhancer,
+                mrstft_loss=mrstft_loss,
+                device=device,
+                args=args,
+            )
 
-        # Save latest checkpoint
-        ckpt = {
+            # Best checkpoint (based on MR-STFT validation loss)
+            if "val_mrstft" in val_metrics:
+                val_mr = float(val_metrics["val_mrstft"])
+                if val_mr < best_val:
+                    best_val = val_mr
+                    best_epoch = epoch
+                    improved = True
+
+        # Build checkpoint payload with current best info
+        ckpt_payload = {
             "epoch": epoch,
+            "best_val": best_val,
+            "best_epoch": best_epoch,
             "enhancer": enhancer.state_dict(),
             "mpd": mpd.state_dict(),
             "msd": msd.state_dict(),
             "g_opt": g_opt.state_dict(),
             "d_opt": d_opt.state_dict(),
-            "val_loss": val_loss,
+            "val_metrics": val_metrics,
             "args": vars(args),
+            "gen_cfg": _to_jsonable(gen_cfg),
+            "tf_cfg": _to_jsonable(tf_cfg),
+            "mr_cfg": _to_jsonable(mr_cfg),
         }
-        torch.save(ckpt, os.path.join(args.save_dir, "last.pt"))
 
-        # Save best so far
-        if val_loss < best_val:
-            best_val = val_loss
-            torch.save(ckpt, os.path.join(args.save_dir, "best.pt"))
+        # Save latest checkpoint (overwritten every epoch to support resuming)
+        torch.save(ckpt_payload, os.path.join(ckpt_dir, "last.pt"))
+
+        # Periodic checkpoints
+        if (epoch % max(args.ckpt_interval, 1) == 0) or (epoch == args.epochs):
+            torch.save(ckpt_payload,
+                       os.path.join(ckpt_dir, f"epoch_{epoch:04d}.pt"))
+
+        # Save best checkpoint (if improved)
+        if do_val and improved:
+            torch.save(ckpt_payload, os.path.join(ckpt_dir, "best.pt"))
             print(
-                f"New best validation loss: {best_val:.4f} (checkpoint saved)")
+                f"New best val MR-STFT: {best_val:.4f} @ epoch {best_epoch} (saved best.pt)"
+            )
+
+        # Log to CSV (after best has potentially been updated)
+        if do_val:
+            _append_csv_row(
+                metrics_csv,
+                {
+                    "epoch": epoch,
+                    **val_metrics,
+                    "best_val_mrstft": best_val,
+                    "best_epoch": best_epoch,
+                },
+            )
 
     print("Training finished.")
 
