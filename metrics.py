@@ -146,8 +146,7 @@ def stoi_score(
     return float(stoi(reference, estimate, sr, extended=extended))
 
 
-def load_mono_wave(path: str,
-                   target_sr: Optional[int] = None) -> (np.ndarray, int):
+def load_mono_wave(path: str, target_sr: Optional[int] = None):
     """
     Load a mono wav as numpy array with optional resampling to target_sr.
     """
@@ -185,7 +184,7 @@ def compute_metrics_for_pair(
     do_pesq: bool = True,
     do_stoi: bool = True,
     estoi: bool = False,
-) -> Dict[str, float]:
+):
     """
     Compute requested metrics for a single utterance pair.
 
