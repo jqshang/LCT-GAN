@@ -262,17 +262,17 @@ def parse_args():
         "--data_root",
         type=str,
         required=True,
-        help="Root dir containing 'train/' and 'test/' subfolders (e.g. .data)."
-    )
+        help=
+        "Root dir containing the dataset folders and scp files (e.g. .data).")
     parser.add_argument(
         "--train_scp",
         type=str,
-        default=os.path.join("train", "train.scp"),
+        default="train.scp",
         help="Path to train.scp (relative to data_root or absolute).")
     parser.add_argument(
         "--test_scp",
         type=str,
-        default=os.path.join("test", "test.scp"),
+        default="test.scp",
         help=
         "Path to test.scp (for validation; relative to data_root or absolute)."
     )
