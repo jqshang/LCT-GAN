@@ -12,17 +12,6 @@ def si_sdr(
     estimate: torch.Tensor,
     eps: float = 1e-8,
 ) -> float:
-    """
-    Scale-Invariant Signal-to-Distortion Ratio (SI-SDR) in dB.
-
-    Args:
-        reference: [T] or [1, T] clean waveform
-        estimate:  [T] or [1, T] enhanced waveform
-        eps: small constant for numerical stability
-
-    Returns:
-        si_sdr_db: float (dB)
-    """
     if reference.dim() == 2:
         reference = reference.squeeze(0)
     if estimate.dim() == 2:
@@ -52,16 +41,6 @@ def batch_si_sdr(
     clean_batch: torch.Tensor,
     enhanced_batch: torch.Tensor,
 ) -> List[float]:
-    """
-    Compute SI-SDR per example in a batch.
-
-    Args:
-        clean_batch: [B, T] or [B, 1, T]
-        enhanced_batch: same shape
-
-    Returns:
-        list of SI-SDR values (len = B)
-    """
     if clean_batch.dim() == 3:
         clean_batch = clean_batch.squeeze(1)
     if enhanced_batch.dim() == 3:
@@ -102,18 +81,6 @@ def pesq_score(
     sr: int,
     mode: str = "wb",
 ) -> float:
-    """
-    Compute PESQ using the 'pesq' package.
-
-    Args:
-        reference: clean signal as 1D numpy array
-        estimate:  enhanced signal as 1D numpy array
-        sr: sampling rate (typically 16000 for 'wb' mode)
-        mode: 'wb' (wide-band) or 'nb' (narrow-band)
-
-    Returns:
-        PESQ score (float)
-    """
     pesq = _require_pesq()
     min_len = min(len(reference), len(estimate))
     reference = reference[:min_len]
@@ -127,18 +94,7 @@ def stoi_score(
     sr: int,
     extended: bool = False,
 ) -> float:
-    """
-    Compute STOI or ESTOI using the 'pystoi' package.
 
-    Args:
-        reference: clean signal as 1D numpy array
-        estimate:  enhanced signal as 1D numpy array
-        sr: sampling rate
-        extended: if True, use extended STOI (ESTOI)
-
-    Returns:
-        STOI or ESTOI score (float)
-    """
     stoi = _require_pystoi()
     min_len = min(len(reference), len(estimate))
     reference = reference[:min_len]
@@ -147,9 +103,7 @@ def stoi_score(
 
 
 def load_mono_wave(path: str, target_sr: Optional[int] = None):
-    """
-    Load a mono wav as numpy array with optional resampling to target_sr.
-    """
+
     if not os.path.exists(path):
         raise FileNotFoundError(path)
 
@@ -185,19 +139,6 @@ def compute_metrics_for_pair(
     do_stoi: bool = True,
     estoi: bool = False,
 ):
-    """
-    Compute requested metrics for a single utterance pair.
-
-    Args:
-        clean_path: path to clean wav
-        enhanced_path: path to enhanced wav
-        sr: sampling rate for loading / PESQ/STOI
-        do_si_sdr, do_pesq, do_stoi: toggles
-        estoi: if True, use ESTOI instead of classic STOI
-
-    Returns:
-        dict with keys among {"si_sdr", "pesq", "stoi"}
-    """
     clean_np, sr_c = load_mono_wave(clean_path, target_sr=sr)
     enh_np, sr_e = load_mono_wave(enhanced_path, target_sr=sr)
 
@@ -272,31 +213,6 @@ def parse_args():
 
 
 def main():
-    # Assume the file structure is as follows:
-    # ├─.data
-    # │  ├─enhanced_dir
-    # │  ├─test
-    # │  │  │  test.scp
-    # │  │  │
-    # │  │  ├─clean
-    # │  │  │      3.wav
-    # │  │  │      4.wav
-    # │  │  │
-    # │  │  └─noisy
-    # │  │          3.wav
-    # │  │          4.wav
-    # │  │
-    # │  └─train
-    # │      │  train.scp
-    # │      │
-    # │      ├─clean
-    # │      │      1.wav
-    # │      │      2.wav
-    # │      │
-    # │      └─noisy
-    # │              1.wav
-    # │              2.wav
-
     args = parse_args()
 
     if not os.path.isabs(args.test_scp):
