@@ -151,9 +151,9 @@ def plot_specs_triptych(
         panels.append((f"Clean (16 kHz)", clean))
     panels.append((f"Noisy (16 kHz)", noisy))
     if ftf is not None:
-        panels.append((f"LCT-GAN (FTFNet)", ftf))
+        panels.append((f"LCT-GAN", ftf))
     if my_ftf is not None:
-        panels.append((f"My LCT (reimpl)", my_ftf))
+        panels.append((f"FTFNet", my_ftf))
     if dfn is not None:
         panels.append((f"DeepFilterNet (↓48 to 16 kHz)", dfn))
 
@@ -309,7 +309,7 @@ class ModelComparator:
     def run_my_lct_gan(self,
                        noisy: torch.Tensor,
                        eps: float = 1e-8) -> torch.Tensor:
-        assert self.my_lct is not None, "My LCT (reimpl) model is not loaded."
+        assert self.my_lct is not None, "FTFNet model is not loaded."
 
         _, _, to_spec, from_spec, expected_F = self._stft_tools()
 
@@ -369,7 +369,7 @@ class ModelComparator:
             out_mag = out_mag.squeeze(1)  # [B,?,?]
         if out_mag.dim() != 3:
             raise RuntimeError(
-                f"Unexpected my_lct output shape: {tuple(out_mag.shape)}")
+                f"Unexpected FTFNet output shape: {tuple(out_mag.shape)}")
 
         B, d1, d2 = out_mag.shape
         if d1 == expected_F:
@@ -378,7 +378,7 @@ class ModelComparator:
             mag_like_bft = out_mag.permute(0, 2, 1).contiguous()  # [B,F,T]
         else:
             raise RuntimeError(
-                f"Cannot infer F/T from my_lct output shape {tuple(out_mag.shape)} "
+                f"Cannot infer F/T from FTFNet output shape {tuple(out_mag.shape)} "
                 f"(expected one dim == {expected_F}).")
 
         enh_stft = mag_like_bft * phase  # complex [B,F,T]
@@ -489,7 +489,7 @@ class ModelComparator:
         if my_model is not None:
             plot_spec(
                 my_model.squeeze(0).cpu().numpy(),
-                title=f"My LCT (reimpl)",
+                title=f"FTFNet",
                 save_path=str(spec_dir / f"my_ftfnet.png"),
             )
 
@@ -627,7 +627,7 @@ class ModelComparator:
                 result.setdefault("my_ftfnet", {}).update(my_diff_meta)
                 diff_wav_np = sf.read(my_diff_meta["diff_dir"],
                                       dtype="float32")[0]
-                diff_panels.append((f"Diff: clean - my_ftfnet", diff_wav_np))
+                diff_panels.append((f"Diff: clean - FTFNet", diff_wav_np))
             # DFN diff (16k)
             if dfn is not None:
                 dfn_diff_meta = self._save_diff_artifacts(
